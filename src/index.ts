@@ -6,6 +6,8 @@ import { z } from "zod";
 import * as net from "node:net";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
+import { EventEmitter } from "node:events";
 
 // --- State ---
 
@@ -13,6 +15,9 @@ let socket: net.Socket | null = null;
 let buffer = "";
 let connected = false;
 let readPosition = 0; // Never delete from buffer, just track what's been read
+let rawBuffer: Buffer = Buffer.alloc(0);
+let decoder: StringDecoder | null = null;
+const mudEvents = new EventEmitter();
 
 // --- Memory Management ---
 
@@ -83,19 +88,36 @@ let currentMemory: CharacterMemory | null = null;
 
 // --- Telnet / ANSI stripping ---
 
-function stripTelnet(data: Buffer): Buffer {
-  const out: number[] = [];
-  let i = 0;
-  while (i < data.length) {
-    if (data[i] === 0xff && i + 2 < data.length) {
-      // IAC + command + option: skip 3 bytes
-      i += 3;
+function processTelnet(data: Buffer): { cleaned: Buffer; remainder: Buffer } {
+  let readIdx = 0;
+  const output: number[] = [];
+
+  while (readIdx < data.length) {
+    // Look for IAC
+    if (data[readIdx] === 0xff) {
+      // Do we have enough bytes for the 3-byte assumption?
+      if (readIdx + 2 < data.length) {
+        // Yes, skip 3 bytes (IAC + CMD + OPT)
+        readIdx += 3;
+      } else {
+        // No, we have a partial sequence at the end.
+        // Return everything processed so far as cleaned,
+        // and the rest as remainder.
+        return {
+          cleaned: Buffer.from(output),
+          remainder: data.subarray(readIdx)
+        };
+      }
     } else {
-      out.push(data[i]!);
-      i++;
+      output.push(data[readIdx]!);
+      readIdx++;
     }
   }
-  return Buffer.from(out);
+
+  return {
+    cleaned: Buffer.from(output),
+    remainder: Buffer.alloc(0)
+  };
 }
 
 function stripAnsi(text: string): string {
@@ -105,12 +127,6 @@ function stripAnsi(text: string): string {
 
 function normalizeLineEndings(text: string): string {
   return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-}
-
-function cleanOutput(data: Buffer): string {
-  const stripped = stripTelnet(data);
-  const text = stripped.toString("utf-8");
-  return normalizeLineEndings(stripAnsi(text));
 }
 
 // --- Helpers ---
@@ -306,6 +322,9 @@ server.registerTool(
     return new Promise((resolve) => {
       buffer = "";
       readPosition = 0;
+      rawBuffer = Buffer.alloc(0);
+      decoder = new StringDecoder("utf8");
+      
       const sock = new net.Socket();
 
       const timeout = setTimeout(() => {
@@ -341,11 +360,26 @@ server.registerTool(
       });
 
       sock.on("data", (data: Buffer) => {
-        const cleaned = cleanOutput(data);
-        console.error(`[clawdwars] Socket data received: ${cleaned.length} chars`);
-        console.error(`[clawdwars] Data preview: ${cleaned.substring(0, 100)}`);
-        buffer += cleaned;
-        console.error(`[clawdwars] Buffer size now: ${buffer.length} chars`);
+        // Append new data to raw buffer
+        rawBuffer = Buffer.concat([rawBuffer, data]);
+
+        // Process Telnet codes statefully
+        const { cleaned, remainder } = processTelnet(rawBuffer);
+        rawBuffer = remainder;
+
+        // Decode UTF-8 statefully
+        if (cleaned.length > 0 && decoder) {
+          const text = decoder.write(cleaned);
+          const processed = normalizeLineEndings(stripAnsi(text));
+
+          if (processed.length > 0) {
+            console.error(`[clawdwars] Processed text: ${processed.length} chars`);
+            // Escape newlines for log preview
+            console.error(`[clawdwars] Preview: ${processed.substring(0, 100).replace(/\n/g, "\\n")}`);
+            buffer += processed;
+            mudEvents.emit("data");
+          }
+        }
       });
 
       sock.on("error", (err) => {
@@ -362,6 +396,17 @@ server.registerTool(
 
       sock.on("close", () => {
         console.error("[clawdwars] Socket closed");
+        
+        // Flush any remaining characters from decoder
+        if (decoder) {
+          const text = decoder.end();
+          if (text.length > 0) {
+             const processed = normalizeLineEndings(stripAnsi(text));
+             buffer += processed;
+          }
+          decoder = null;
+        }
+        
         connected = false;
         socket = null;
       });
@@ -430,9 +475,43 @@ server.registerTool(
       };
     }
 
-    console.error(`[clawdwars] mud_read() called. Buffer size: ${buffer.length} chars`);
+    console.error(`[clawdwars] mud_read() called. Buffer size: ${buffer.length} chars, Read pos: ${readPosition}`);
+
+    // If we have unread data, return it immediately
+    if (buffer.length > readPosition) {
+      const text = drainBuffer();
+      console.error(`[clawdwars] mud_read() returning immediately: ${text.length} chars`);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: text,
+          },
+        ],
+      };
+    }
+
+    // Otherwise, wait for data (long-polling)
+    console.error("[clawdwars] Buffer empty, waiting for data...");
+    
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => {
+        mudEvents.off("data", onData);
+        resolve();
+      }, 5000); // 5 second long poll
+
+      const onData = () => {
+        clearTimeout(timeout);
+        mudEvents.off("data", onData);
+        resolve();
+      };
+
+      mudEvents.once("data", onData);
+    });
+
     const text = drainBuffer(); // Return new content since last read
-    console.error(`[clawdwars] mud_read() returning: ${text.length} chars`);
+    console.error(`[clawdwars] mud_read() returning after wait: ${text.length} chars`);
+    
     return {
       content: [
         {
