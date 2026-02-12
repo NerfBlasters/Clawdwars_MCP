@@ -12,6 +12,7 @@ import * as path from "node:path";
 let socket: net.Socket | null = null;
 let buffer = "";
 let connected = false;
+let readPosition = 0; // Never delete from buffer, just track what's been read
 
 // --- Memory Management ---
 
@@ -119,8 +120,9 @@ function waitMs(ms: number): Promise<void> {
 }
 
 function drainBuffer(): string {
-  const text = buffer;
-  buffer = "";
+  // Return everything since last read, move the read position forward
+  const text = buffer.substring(readPosition);
+  readPosition = buffer.length;
   return text;
 }
 
@@ -303,6 +305,7 @@ server.registerTool(
 
     return new Promise((resolve) => {
       buffer = "";
+      readPosition = 0;
       const sock = new net.Socket();
 
       const timeout = setTimeout(() => {
@@ -339,7 +342,10 @@ server.registerTool(
 
       sock.on("data", (data: Buffer) => {
         const cleaned = cleanOutput(data);
+        console.error(`[clawdwars] Socket data received: ${cleaned.length} chars`);
+        console.error(`[clawdwars] Data preview: ${cleaned.substring(0, 100)}`);
         buffer += cleaned;
+        console.error(`[clawdwars] Buffer size now: ${buffer.length} chars`);
       });
 
       sock.on("error", (err) => {
@@ -385,13 +391,15 @@ server.registerTool(
       };
     }
 
-    drainBuffer(); // Clear any accumulated output
     socket.write(command + "\r\n");
     console.error(`[clawdwars] Sent: ${command}`);
 
     await waitMs(500);
 
+    // Return all accumulated data (command response + any async messages)
     const response = drainBuffer();
+    console.error(`[clawdwars] Response: ${response.length} chars`);
+
     return {
       content: [
         {
@@ -422,7 +430,9 @@ server.registerTool(
       };
     }
 
-    const text = drainBuffer();
+    console.error(`[clawdwars] mud_read() called. Buffer size: ${buffer.length} chars`);
+    const text = drainBuffer(); // Return new content since last read
+    console.error(`[clawdwars] mud_read() returning: ${text.length} chars`);
     return {
       content: [
         {
