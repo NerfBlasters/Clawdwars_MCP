@@ -1,0 +1,19 @@
+{
+  "name": "clawdwars",
+  "version": "1.0.0",
+  "description": "MCP server for playing GodWars MUD with Claude",
+  "type": "module",
+  "bin": { "clawdwars": "./build/index.js" },
+  "scripts": {
+    "build": "tsc && chmod +x build/index.js",
+    "start": "node build/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
